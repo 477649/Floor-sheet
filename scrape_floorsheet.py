@@ -8,34 +8,45 @@ from bs4 import BeautifulSoup
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
 URL = "https://chukul.com/floorsheet"
 
-# ✅ GitHub Actions env (set in workflow.yml)
-START_DATE = os.getenv("START_DATE", datetime.today().strftime("%Y-%m-%d"))
-END_DATE = os.getenv("END_DATE", datetime.today().strftime("%Y-%m-%d"))
+# ✅ Can be YYYY-MM-DD or YYYY/MM/DD
+START_DATE_RAW = os.getenv("START_DATE", datetime.today().strftime("%Y-%m-%d"))
+END_DATE_RAW = os.getenv("END_DATE", datetime.today().strftime("%Y-%m-%d"))
 
 HEADER = ["Transact No.", "Symbol", "Buyer", "Seller", "Quantity", "Rate", "Amount"]
 
-# ✅ Date field container having calendar icon text 'event'
-DATE_FIELD_XPATH = (
-    "//div[contains(@class,'q-field__control-container') "
-    "and .//i[contains(@class,'q-icon') and normalize-space()='event']]"
-)
-
-# ✅ Calendar popup root
-CALENDAR_ROOT_CSS = "div.q-date"
-
-# ✅ "As of: YYYY/MM/DD" text on page (used to verify date really changed)
+# ✅ "As of: YYYY/MM/DD" text on page
 ASOF_XPATH = "//*[contains(normalize-space(.),'As of:')]"
 
-MONTH_NAMES = [
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December"
-]
+# ✅ Main date input: class-based (ID changes every refresh)
+DATE_INPUT_XPATH = "//input[contains(@class,'q-field__native') and @type='text']"
+
+
+def normalize_date_str(s: str) -> str:
+    """Accepts YYYY-MM-DD or YYYY/MM/DD. Returns YYYY-MM-DD."""
+    s = s.strip()
+    if "/" in s:
+        parts = s.split("/")
+        if len(parts) == 3:
+            y, m, d = parts
+            return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+    # assume YYYY-MM-DD
+    parts = s.split("-")
+    if len(parts) == 3:
+        y, m, d = parts
+        return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+    raise ValueError(f"Invalid date format: {s}. Use YYYY-MM-DD or YYYY/MM/DD.")
+
+
+def ymd_to_ui(ymd: str) -> str:
+    """YYYY-MM-DD -> YYYY/MM/DD"""
+    return ymd.replace("-", "/")
 
 
 def parse_numeric(value):
@@ -79,8 +90,8 @@ def first_row_key(driver):
 def go_to_next_page(driver, wait, current_page):
     """
     ✅ Improved last-page capture logic:
-    - Click next page by VISIBLE TEXT (e.g., '139')
-    - Wait until first row changes so we don't re-scrape the same page
+    - Click next page by VISIBLE TEXT
+    - Wait until first row changes so we don't re-scrape same page
     """
     target = str(current_page + 1)
 
@@ -103,10 +114,7 @@ def go_to_next_page(driver, wait, current_page):
 
 
 def read_asof_date(driver):
-    """
-    Reads 'As of: YYYY/MM/DD' from page header.
-    Returns 'YYYY/MM/DD' or None.
-    """
+    """Returns 'YYYY/MM/DD' from 'As of: YYYY/MM/DD', or None."""
     try:
         el = driver.find_element(By.XPATH, ASOF_XPATH)
         txt = el.text.strip()
@@ -119,127 +127,53 @@ def read_asof_date(driver):
     return None
 
 
-def open_calendar(driver, wait):
+def set_floorsheet_date_text(driver, wait, date_ymd):
     """
-    ✅ Headless-safe: scroll + JS click + wait for q-date popup.
+    ✅ GitHub Actions SAFE method:
+    - Focus date input
+    - Clear
+    - Type YYYY/MM/DD
+    - Press ENTER
+    - Blur + body click
+    - Verify 'As of:' updated
     """
-    field = wait.until(EC.presence_of_element_located((By.XPATH, DATE_FIELD_XPATH)))
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", field)
-    time.sleep(0.3)
-    driver.execute_script("arguments[0].click();", field)
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, CALENDAR_ROOT_CSS)))
-
-
-def get_calendar_nav_text(driver):
-    """Gets navigation text containing month and year (e.g. 'January 2026')."""
-    nav = driver.find_element(By.CSS_SELECTOR, "div.q-date__navigation")
-    return nav.text.replace("\n", " ").strip()
-
-
-def click_nav_next_prev(driver, direction):
-    """
-    Clicks next/prev arrow inside calendar navigation.
-    direction: 'next' or 'prev'
-    """
-    btns = driver.find_elements(By.CSS_SELECTOR, "div.q-date__navigation button")
-    if not btns:
-        raise RuntimeError("Calendar navigation buttons not found")
-
-    if direction == "prev":
-        driver.execute_script("arguments[0].click();", btns[0])
-    else:
-        driver.execute_script("arguments[0].click();", btns[-1])
-
-
-def ensure_month_year(driver, wait, target_year, target_month):
-    """
-    Navigate the calendar popup to target month/year by using next/prev arrows.
-    target_month: 1-12
-    """
-    target_month_name = MONTH_NAMES[target_month - 1]
-    target_year_str = str(target_year)
-
-    for _ in range(60):  # safety limit
-        nav_txt = get_calendar_nav_text(driver)
-
-        if (target_month_name in nav_txt) and (target_year_str in nav_txt):
-            return
-
-        # Determine current month/year
-        current_month = None
-        for mn in MONTH_NAMES:
-            if mn in nav_txt:
-                current_month = mn
-                break
-
-        current_year = None
-        for token in nav_txt.split():
-            if token.isdigit() and len(token) == 4:
-                current_year = int(token)
-                break
-
-        if current_month is None or current_year is None:
-            click_nav_next_prev(driver, "next")
-            time.sleep(0.2)
-            continue
-
-        cur_month_num = MONTH_NAMES.index(current_month) + 1
-
-        if (current_year, cur_month_num) < (target_year, target_month):
-            click_nav_next_prev(driver, "next")
-        else:
-            click_nav_next_prev(driver, "prev")
-
-        time.sleep(0.2)
-
-    raise RuntimeError("Could not reach target month/year in calendar.")
-
-
-def click_day(driver, wait, day_int):
-    """
-    ✅ Headless-safe day click.
-    Click only in-month days (not out-of-month), scroll into view, JS click.
-    """
-    day_xpath = (
-        f"//div[contains(@class,'q-date__calendar-item') "
-        f"and not(contains(@class,'q-date__calendar-item--out'))]"
-        f"//*[normalize-space()='{day_int}']"
-    )
-
-    el = wait.until(EC.presence_of_element_located((By.XPATH, day_xpath)))
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-    time.sleep(0.2)
-    driver.execute_script("arguments[0].click();", el)
-
-
-def set_floorsheet_date_by_calendar(driver, wait, date_ymd):
-    """
-    ✅ Reliable: open calendar popup and click the day.
-    Verifies 'As of' changes to the requested date.
-    """
-    y, m, d = date_ymd.split("-")
-    y = int(y)
-    m = int(m)
-    d_int = int(d)
-
-    target_asof = date_ymd.replace("-", "/")
+    date_ui = ymd_to_ui(date_ymd)
     before_asof = read_asof_date(driver)
 
-    open_calendar(driver, wait)
-    ensure_month_year(driver, wait, y, m)
-    click_day(driver, wait, d_int)
+    # Find the date input (ID changes, so use class)
+    input_el = wait.until(EC.presence_of_element_located((By.XPATH, DATE_INPUT_XPATH)))
 
-    # Wait for table + asof update
+    # Scroll and focus
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", input_el)
+    time.sleep(0.2)
+    driver.execute_script("arguments[0].click();", input_el)
+    time.sleep(0.1)
+
+    # Clear: Ctrl+A then Backspace (more reliable than .clear() on Quasar)
+    input_el.send_keys(Keys.CONTROL, "a")
+    input_el.send_keys(Keys.BACKSPACE)
+    time.sleep(0.05)
+
+    # Type date + Enter
+    input_el.send_keys(date_ui)
+    input_el.send_keys(Keys.ENTER)
+
+    # Force commit
+    driver.execute_script("arguments[0].blur();", input_el)
+    driver.execute_script("document.body.click();")
+
+    # Wait for table (page usually refreshes)
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
 
+    # Verify the date actually applied
     for _ in range(30):
-        now_asof = read_asof_date(driver)
-        if now_asof == target_asof:
+        now = read_asof_date(driver)
+        if now == date_ui:
             return
-        time.sleep(0.2)
+        time.sleep(0.25)
 
     raise RuntimeError(
-        f"Date did not apply. Expected As of {target_asof}, got {read_asof_date(driver)} (before was {before_asof})"
+        f"Date did not apply via text input. Expected As of {date_ui}, got {read_asof_date(driver)} (before was {before_asof})"
     )
 
 
@@ -247,8 +181,8 @@ def scrape_one_date(driver, wait, date_ymd):
     driver.get(URL)
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
 
-    # ✅ Apply date via calendar
-    set_floorsheet_date_by_calendar(driver, wait, date_ymd)
+    # ✅ Apply date reliably (no popup calendar)
+    set_floorsheet_date_text(driver, wait, date_ymd)
 
     all_data = []
     current_page = 1
@@ -282,8 +216,11 @@ def scrape_one_date(driver, wait, date_ymd):
 def main():
     os.makedirs("outputs", exist_ok=True)
 
-    dates = pd.date_range(START_DATE, END_DATE, freq="D").strftime("%Y-%m-%d").tolist()
-    print(f"Scraping from {START_DATE} to {END_DATE} ({len(dates)} day(s))")
+    start_date = normalize_date_str(START_DATE_RAW)
+    end_date = normalize_date_str(END_DATE_RAW)
+
+    dates = pd.date_range(start_date, end_date, freq="D").strftime("%Y-%m-%d").tolist()
+    print(f"Scraping from {start_date} to {end_date} ({len(dates)} day(s))")
 
     chrome_options = webdriver.ChromeOptions()
     chrome_options.add_argument("--headless=new")
@@ -293,7 +230,7 @@ def main():
     chrome_options.add_argument("--window-size=1920,1080")
 
     driver = webdriver.Chrome(options=chrome_options)
-    wait = WebDriverWait(driver, 30)
+    wait = WebDriverWait(driver, 45)  # a bit longer for GitHub runners
 
     try:
         for d in dates:
@@ -314,11 +251,7 @@ def main():
                 traceback.print_exc()
                 continue
 
-        # Debug: list files created (helps confirm outputs exists on runner)
-        try:
-            print("Files in outputs:", os.listdir("outputs"))
-        except Exception:
-            pass
+        print("Files in outputs:", os.listdir("outputs"))
 
     finally:
         driver.quit()
