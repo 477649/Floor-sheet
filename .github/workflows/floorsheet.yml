@@ -1,0 +1,37 @@
+name: Floorsheet Scraper
+
+on:
+  schedule:
+    - cron: "45 9 * * *"  # 09:45 UTC = 15:30 Nepal time
+  workflow_dispatch:
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper (date range)
+        env:
+          START_DATE: "2026-01-01"
+          END_DATE: "2026-01-07"
+        run: |
+          python scrape_floorsheet.py
+
+      - name: Upload outputs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: floorsheet-outputs
+          path: outputs/
