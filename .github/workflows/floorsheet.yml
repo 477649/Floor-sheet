@@ -25,7 +25,7 @@ jobs:
 
       - name: Run scraper (date range)
         env:
-          START_DATE: "2026-01-01"
+          START_DATE: "2025-12-01"
           END_DATE: "2026-01-07"
         run: |
           python scrape_floorsheet.py
