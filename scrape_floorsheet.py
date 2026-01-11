@@ -1,5 +1,6 @@
 import os
 import time
+import traceback
 from datetime import datetime
 
 import pandas as pd
@@ -19,7 +20,7 @@ END_DATE = os.getenv("END_DATE", datetime.today().strftime("%Y-%m-%d"))
 
 HEADER = ["Transact No.", "Symbol", "Buyer", "Seller", "Quantity", "Rate", "Amount"]
 
-# ✅ Date field: we click the date field (calendar icon is inside the same q-field)
+# ✅ Date field container having calendar icon text 'event'
 DATE_FIELD_XPATH = (
     "//div[contains(@class,'q-field__control-container') "
     "and .//i[contains(@class,'q-icon') and normalize-space()='event']]"
@@ -111,7 +112,6 @@ def read_asof_date(driver):
         txt = el.text.strip()
         if "As of:" in txt:
             part = txt.split("As of:")[1].strip().split()[0]
-            # expected like 2026/01/07
             if "/" in part:
                 return part
     except Exception:
@@ -120,16 +120,18 @@ def read_asof_date(driver):
 
 
 def open_calendar(driver, wait):
-    """Click date field to open calendar popup."""
-    field = wait.until(EC.element_to_be_clickable((By.XPATH, DATE_FIELD_XPATH)))
+    """
+    ✅ Headless-safe: scroll + JS click + wait for q-date popup.
+    """
+    field = wait.until(EC.presence_of_element_located((By.XPATH, DATE_FIELD_XPATH)))
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", field)
+    time.sleep(0.3)
     driver.execute_script("arguments[0].click();", field)
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, CALENDAR_ROOT_CSS)))
 
 
 def get_calendar_nav_text(driver):
-    """
-    Gets navigation text containing month and year (e.g. 'January 2026')
-    """
+    """Gets navigation text containing month and year (e.g. 'January 2026')."""
     nav = driver.find_element(By.CSS_SELECTOR, "div.q-date__navigation")
     return nav.text.replace("\n", " ").strip()
 
@@ -157,7 +159,7 @@ def ensure_month_year(driver, wait, target_year, target_month):
     target_month_name = MONTH_NAMES[target_month - 1]
     target_year_str = str(target_year)
 
-    for _ in range(48):  # enough for 4 years movement safely
+    for _ in range(60):  # safety limit
         nav_txt = get_calendar_nav_text(driver)
 
         if (target_month_name in nav_txt) and (target_year_str in nav_txt):
@@ -170,7 +172,6 @@ def ensure_month_year(driver, wait, target_year, target_month):
                 current_month = mn
                 break
 
-        # Extract current year
         current_year = None
         for token in nav_txt.split():
             if token.isdigit() and len(token) == 4:
@@ -178,14 +179,12 @@ def ensure_month_year(driver, wait, target_year, target_month):
                 break
 
         if current_month is None or current_year is None:
-            # fallback: try next
             click_nav_next_prev(driver, "next")
             time.sleep(0.2)
             continue
 
         cur_month_num = MONTH_NAMES.index(current_month) + 1
 
-        # Compare (year, month)
         if (current_year, cur_month_num) < (target_year, target_month):
             click_nav_next_prev(driver, "next")
         else:
@@ -198,30 +197,19 @@ def ensure_month_year(driver, wait, target_year, target_month):
 
 def click_day(driver, wait, day_int):
     """
-    Click day number inside currently displayed month.
-    We avoid clicking days from other months (they often have different classes).
+    ✅ Headless-safe day click.
+    Click only in-month days (not out-of-month), scroll into view, JS click.
     """
-    # Prefer enabled, in-month day buttons (q-date__calendar-item)
-    # We'll click a button/span that matches the day text.
-    day_xpath_candidates = [
-        # Common: day is a button inside q-date__calendar-item
-        f"//div[contains(@class,'q-date__calendar')]//div[contains(@class,'q-date__calendar-item')]//button[normalize-space()='{day_int}']",
-        # Sometimes day is a div/span
-        f"//div[contains(@class,'q-date__calendar')]//div[contains(@class,'q-date__calendar-item')]//*[normalize-space()='{day_int}']",
-    ]
+    day_xpath = (
+        f"//div[contains(@class,'q-date__calendar-item') "
+        f"and not(contains(@class,'q-date__calendar-item--out'))]"
+        f"//*[normalize-space()='{day_int}']"
+    )
 
-    for xp in day_xpath_candidates:
-        els = driver.find_elements(By.XPATH, xp)
-        # choose first visible/clickable
-        for el in els:
-            try:
-                if el.is_displayed() and el.is_enabled():
-                    driver.execute_script("arguments[0].click();", el)
-                    return
-            except Exception:
-                continue
-
-    raise RuntimeError(f"Day {day_int} not clickable in calendar.")
+    el = wait.until(EC.presence_of_element_located((By.XPATH, day_xpath)))
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    time.sleep(0.2)
+    driver.execute_script("arguments[0].click();", el)
 
 
 def set_floorsheet_date_by_calendar(driver, wait, date_ymd):
@@ -235,43 +223,31 @@ def set_floorsheet_date_by_calendar(driver, wait, date_ymd):
     d_int = int(d)
 
     target_asof = date_ymd.replace("-", "/")
-
-    # Read current "As of" (for change detection)
     before_asof = read_asof_date(driver)
 
-    # Open calendar popup
     open_calendar(driver, wait)
-
-    # Navigate to correct month/year
     ensure_month_year(driver, wait, y, m)
-
-    # Click the day
     click_day(driver, wait, d_int)
 
     # Wait for table + asof update
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
 
-    # Confirm asof changed (retry a bit)
-    for _ in range(20):
+    for _ in range(30):
         now_asof = read_asof_date(driver)
         if now_asof == target_asof:
             return
-        # If it didn't change, wait a bit
         time.sleep(0.2)
 
-    # If it still didn't update, raise (prevents "same file every day" issue)
-    raise RuntimeError(f"Date did not apply. Expected As of {target_asof}, got {read_asof_date(driver)} (before was {before_asof})")
+    raise RuntimeError(
+        f"Date did not apply. Expected As of {target_asof}, got {read_asof_date(driver)} (before was {before_asof})"
+    )
 
 
 def scrape_one_date(driver, wait, date_ymd):
-    """
-    date_ymd: 'YYYY-MM-DD'
-    returns DataFrame for that date
-    """
     driver.get(URL)
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
 
-    # ✅ Apply date reliably via calendar click
+    # ✅ Apply date via calendar
     set_floorsheet_date_by_calendar(driver, wait, date_ymd)
 
     all_data = []
@@ -329,12 +305,20 @@ def main():
                 print(f"Rows: {len(df)} | Total Amount: {total_amount:,.2f}")
 
                 out_xlsx = f"outputs/floorsheet_{d}.xlsx"
+                print("Saving file:", out_xlsx)
                 df.to_excel(out_xlsx, index=False)
                 print(f"Saved: {out_xlsx}")
 
             except Exception as e:
-                print(f"❌ Failed for date {d}: {e}")
+                print(f"❌ Failed for date {d}: {repr(e)}")
+                traceback.print_exc()
                 continue
+
+        # Debug: list files created (helps confirm outputs exists on runner)
+        try:
+            print("Files in outputs:", os.listdir("outputs"))
+        except Exception:
+            pass
 
     finally:
         driver.quit()
