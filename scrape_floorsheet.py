@@ -57,26 +57,51 @@ def scrape_current_page(driver):
     return data
 
 
-def go_to_next_page(driver, current_page):
+def first_row_key(driver):
+    """Used to confirm page actually changed after clicking next."""
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, "table tbody tr td")
+        return el.text.strip()
+    except Exception:
+        return None
+
+
+def go_to_next_page(driver, wait, current_page):
     """
-    Click numeric page button for next page.
-    If the site hides page numbers (sliding window) and this stops early,
-    tell me and I'll switch to "Next arrow until disabled" logic.
+    ✅ Updated last-page capture logic (more reliable):
+
+    - Click next page button by VISIBLE TEXT (e.g., '139'), not aria-label.
+    - Wait until first row changes so we don't scrape same page again.
+    - If target page number button is not found -> last page reached.
     """
-    buttons = driver.find_elements(By.CSS_SELECTOR, "div.q-pagination__middle button")
     target = str(current_page + 1)
-    for b in buttons:
-        if b.get_attribute("aria-label") == target:
-            driver.execute_script("arguments[0].click();", b)
-            return True
-    return False
+
+    # Find the next page button anywhere inside q-pagination by its visible number text
+    buttons = driver.find_elements(
+        By.XPATH,
+        f"//div[contains(@class,'q-pagination')]//button[normalize-space()='{target}']"
+    )
+
+    if not buttons:
+        return False  # No next page visible => likely last page
+
+    before = first_row_key(driver)
+
+    driver.execute_script("arguments[0].click();", buttons[0])
+
+    # Wait until table content changes (prevents scraping the same page again)
+    if before is not None:
+        wait.until(lambda d: first_row_key(d) != before)
+    else:
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+
+    return True
 
 
 def set_floorsheet_date(driver, wait, date_ui):
     """
     ✅ Headless/GitHub-safe:
-    - Scroll to date input
-    - Set value using JS
+    - Set date value using JS (avoid send_keys element not interactable)
     - Dispatch input/change events (Quasar/Vue)
     - Blur + body click to force apply
     date_ui format: 'YYYY/MM/DD'
@@ -103,7 +128,6 @@ def set_floorsheet_date(driver, wait, date_ui):
         date_ui,
     )
 
-    # Wait table to be present, and give a small pause for the data to refresh
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
     time.sleep(1)
 
@@ -127,12 +151,13 @@ def scrape_one_date(driver, wait, date_ymd):
     while True:
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
         all_data.extend(scrape_current_page(driver))
+        print(f"Scraped page: {current_page}")
 
-        if not go_to_next_page(driver, current_page):
+        if not go_to_next_page(driver, wait, current_page):
+            print("Reached last page.")
             break
 
         current_page += 1
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
 
     if not all_data:
         return pd.DataFrame(columns=HEADER)
@@ -160,6 +185,8 @@ def main():
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
 
     driver = webdriver.Chrome(options=chrome_options)
     wait = WebDriverWait(driver, 30)
@@ -179,7 +206,6 @@ def main():
 
             except Exception as e:
                 print(f"❌ Failed for date {d}: {e}")
-                # Continue to next date even if one date fails
                 continue
 
     finally:
