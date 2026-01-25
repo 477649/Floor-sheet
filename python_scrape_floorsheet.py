@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -16,7 +17,7 @@ from selenium.webdriver.support import expected_conditions as EC
 URL = "https://chukul.com/floorsheet"
 
 # ----------------------------
-# DATE PICKER (ADDED PART ONLY)
+# DATE PICKER (stable selectors)
 # ----------------------------
 QDATE_ROOT_CSS = "div.q-menu.q-position-engine div.q-date"
 MONTH_VIEW_CSS = "div.q-date__view.q-date__months.flex.flex-center"
@@ -42,6 +43,16 @@ MONTH_ABBR = {
 }
 
 
+def retry_on_stale(fn, tries=4, sleep=0.2):
+    for i in range(tries):
+        try:
+            return fn()
+        except StaleElementReferenceException:
+            if i == tries - 1:
+                raise
+            time.sleep(sleep)
+
+
 def wait_qdate(driver, timeout=20):
     return WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, QDATE_ROOT_CSS))
@@ -49,9 +60,6 @@ def wait_qdate(driver, timeout=20):
 
 
 def find_date_input(driver):
-    """
-    Finds the date input on the page (value like YYYY/MM/DD).
-    """
     inputs = driver.find_elements(By.XPATH, "//input[(@type='text' or not(@type))]")
     for el in inputs:
         try:
@@ -66,9 +74,6 @@ def find_date_input(driver):
 
 
 def open_calendar(driver, timeout=20):
-    """
-    Opens the date picker by clicking the date input.
-    """
     el = find_date_input(driver)
     if not el:
         raise RuntimeError("Date input not found")
@@ -89,8 +94,7 @@ def set_year(driver, year: int, timeout=20):
     ybtn = wait.until(EC.element_to_be_clickable((By.XPATH, NAV_YEAR_BTN_XPATH)))
     driver.execute_script("arguments[0].click();", ybtn)
 
-    root = wait_qdate(driver, timeout)
-    wait.until(lambda d: root.find_element(By.CSS_SELECTOR, YEAR_VIEW_CSS))
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {YEAR_VIEW_CSS}")))
     time.sleep(0.1)
 
     year_xpath = (
@@ -127,69 +131,74 @@ def set_year(driver, year: int, timeout=20):
 
 def set_month(driver, month: int, timeout=20):
     """
-    Month grid click (case-insensitive: works for Jan vs JAN).
+    Stale-safe month selection:
+    - never waits inside old root element
+    - finds month grid from driver every time
+    - retries on Quasar re-render
     """
     abbr = MONTH_ABBR[month]
     wait = WebDriverWait(driver, timeout)
 
-    root = wait_qdate(driver, timeout)
+    def _do():
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, QDATE_ROOT_CSS)))
 
-    # Open month grid only if not already open
-    if not root.find_elements(By.CSS_SELECTOR, MONTH_VIEW_CSS):
-        mbtn = wait.until(EC.element_to_be_clickable((By.XPATH, NAV_MONTH_BTN_XPATH)))
-        driver.execute_script("arguments[0].click();", mbtn)
-        root = wait_qdate(driver, timeout)
+        # Open month grid only if not already open
+        if not driver.find_elements(By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {MONTH_VIEW_CSS}"):
+            mbtn = wait.until(EC.element_to_be_clickable((By.XPATH, NAV_MONTH_BTN_XPATH)))
+            driver.execute_script("arguments[0].click();", mbtn)
 
-    month_view = WebDriverWait(root, timeout).until(
-        lambda r: r.find_element(By.CSS_SELECTOR, MONTH_VIEW_CSS)
-    )
+        month_view = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {MONTH_VIEW_CSS}"))
+        )
 
-    month_btn_xpath = (
-        ".//button[.//span["
-        "translate(normalize-space(.),"
-        "'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
-        f"='{abbr}'"
-        "]]"
-    )
+        month_btn_xpath = (
+            ".//button[.//span[translate(normalize-space(.),"
+            "'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
+            f"='{abbr}']]"
+        )
 
-    btn = WebDriverWait(month_view, timeout).until(
-        EC.element_to_be_clickable((By.XPATH, month_btn_xpath))
-    )
-    driver.execute_script("arguments[0].click();", btn)
-    time.sleep(0.10)
+        btn = WebDriverWait(month_view, timeout).until(
+            EC.element_to_be_clickable((By.XPATH, month_btn_xpath))
+        )
+        driver.execute_script("arguments[0].click();", btn)
+        time.sleep(0.1)
+
+    return retry_on_stale(_do)
 
 
 def click_day(driver, day: int, timeout=20):
-    root = wait_qdate(driver, timeout)
-    day_view = WebDriverWait(root, timeout).until(
-        lambda r: r.find_element(By.CSS_SELECTOR, DAY_VIEW_CSS)
-    )
-
-    day_btn_xpath = (
-        ".//div[contains(@class,'q-date__calendar-item--in')]"
-        f"//button[.//span[normalize-space(text())='{day}']]"
-    )
-
-    btn = WebDriverWait(day_view, timeout).until(
-        EC.element_to_be_clickable((By.XPATH, day_btn_xpath))
-    )
-    driver.execute_script("arguments[0].click();", btn)
-    time.sleep(0.10)
-
-    # Helps some UIs apply the selected day
-    try:
-        driver.switch_to.active_element.send_keys(Keys.ENTER)
-    except Exception:
-        pass
-
-
-def wait_date_applied(driver, target_ymd: str, timeout=30):
     """
-    Wait until the page date input shows the target date (YYYY/MM/DD or YYYY-MM-DD).
+    Stale-safe day selection (same reason as month).
     """
     wait = WebDriverWait(driver, timeout)
 
-    # input value on site is usually YYYY/MM/DD
+    def _do():
+        day_view = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {DAY_VIEW_CSS}"))
+        )
+
+        day_btn_xpath = (
+            ".//div[contains(@class,'q-date__calendar-item--in')]"
+            f"//button[.//span[normalize-space(text())='{day}']]"
+        )
+
+        btn = WebDriverWait(day_view, timeout).until(
+            EC.element_to_be_clickable((By.XPATH, day_btn_xpath))
+        )
+        driver.execute_script("arguments[0].click();", btn)
+        time.sleep(0.1)
+
+        # Helps some UIs apply the selected date
+        try:
+            driver.switch_to.active_element.send_keys(Keys.ENTER)
+        except Exception:
+            pass
+
+    return retry_on_stale(_do)
+
+
+def wait_date_applied(driver, target_ymd: str, timeout=30):
+    wait = WebDriverWait(driver, timeout)
     target_slash = target_ymd.replace("-", "/")
 
     def _ok(d):
@@ -203,9 +212,6 @@ def wait_date_applied(driver, target_ymd: str, timeout=30):
 
 
 def pick_date(driver, date_str: str, timeout=30):
-    """
-    date_str: 'YYYY-MM-DD'
-    """
     dt = datetime.strptime(date_str, "%Y-%m-%d")
 
     open_calendar(driver, timeout=timeout)
@@ -216,10 +222,7 @@ def pick_date(driver, date_str: str, timeout=30):
     set_month(driver, dt.month, timeout=timeout)
     click_day(driver, dt.day, timeout=timeout)
 
-    # Wait for UI to apply the selected date
     wait_date_applied(driver, date_str, timeout=timeout)
-
-    # After date change, table may reload (ensure present)
     WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
 
 
@@ -285,9 +288,6 @@ def go_to_next_page(driver, wait, current_page):
 
 
 def daterange_inclusive(start_date: str, end_date: str):
-    """
-    start_date/end_date format: YYYY-MM-DD
-    """
     s = datetime.strptime(start_date, "%Y-%m-%d").date()
     e = datetime.strptime(end_date, "%Y-%m-%d").date()
     d = s
@@ -297,27 +297,18 @@ def daterange_inclusive(start_date: str, end_date: str):
 
 
 def main():
-    # ✅ Repo root (IMPORTANT)
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-    # Nepal time
     npt = timezone(timedelta(hours=5, minutes=45))
 
-    # ----------------------------
-    # DATE RANGE INPUT (ADDED)
-    # - For GitHub Actions: set env START_DATE and END_DATE
-    # - Fallback: today only
-    # ----------------------------
     start_date = os.getenv("START_DATE")
     end_date = os.getenv("END_DATE")
 
     if not start_date or not end_date:
-        # fallback: run only today (Nepal date)
         today_npt = datetime.now(npt).strftime("%Y-%m-%d")
         start_date = today_npt
         end_date = today_npt
 
-    # ✅ EXACT location: outputs/Floor Sheet
     out_dir = os.path.join(BASE_DIR, "outputs", "Floor Sheet")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -340,13 +331,9 @@ def main():
         driver.get(URL)
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
 
-        # ----------------------------
-        # LOOP EACH DATE (ADDED)
-        # ----------------------------
         for run_date in daterange_inclusive(start_date, end_date):
             print(f"\n=== Processing date: {run_date} ===")
 
-            # pick date in UI (new)
             pick_date(driver, run_date, timeout=30)
 
             out_csv = os.path.join(out_dir, f"floorsheet_{run_date}.csv")
@@ -367,7 +354,6 @@ def main():
             header = ["Transact No.", "Symbol", "Buyer", "Seller", "Quantity", "Rate", "Amount"]
 
             if df.empty:
-                # still save empty file (useful for closed days)
                 df = pd.DataFrame(columns=header)
 
             if df.shape[1] == len(header):
@@ -376,14 +362,10 @@ def main():
                 df["Rate"] = df["Rate"].apply(parse_numeric)
                 df["Amount"] = df["Amount"].apply(parse_numeric)
             else:
-                # Keep your original strictness, but show what happened
                 raise ValueError(f"Column mismatch on {run_date}. Got {df.shape[1]} columns.")
 
             df.to_csv(out_csv, index=False, encoding="utf-8-sig")
             print(f"Saved successfully: {out_csv}")
-
-            # Important: after finishing last page, next date will repick and refresh the table.
-            # No extra navigation needed.
 
     finally:
         driver.quit()
