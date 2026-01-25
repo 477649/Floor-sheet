@@ -64,13 +64,11 @@ def is_calendar_open(driver):
 
 
 def close_calendar(driver):
-    # Close popup reliably (ESC) if open
     if is_calendar_open(driver):
         try:
             driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
         except Exception:
             pass
-        # Wait it disappears (best-effort)
         for _ in range(20):
             if not is_calendar_open(driver):
                 return
@@ -92,10 +90,6 @@ def find_date_input(driver):
 
 
 def open_calendar(driver, timeout=20):
-    """
-    Always opens calendar fresh:
-    - if open, close then reopen (avoids stuck state after previous date)
-    """
     close_calendar(driver)
 
     el = find_date_input(driver)
@@ -110,31 +104,22 @@ def open_calendar(driver, timeout=20):
 
 
 def ensure_month_grid_open(driver, timeout=20):
-    """
-    Robustly open the month grid (JAN-DEC).
-    Retries because Quasar sometimes ignores the first click in headless.
-    """
     wait = WebDriverWait(driver, timeout)
 
     def _try_open():
-        # If already open, ok
         if driver.find_elements(By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {MONTH_VIEW_CSS}"):
             return True
 
-        # Click month label in navigation
         mbtn = wait.until(EC.element_to_be_clickable((By.XPATH, NAV_MONTH_BTN_XPATH)))
         driver.execute_script("arguments[0].click();", mbtn)
 
-        # Wait month grid appears
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {MONTH_VIEW_CSS}")))
         return True
 
-    # Attempt multiple times; if still fails, reopen calendar and try again
-    for attempt in range(3):
+    for _ in range(3):
         try:
             return retry_on_stale(_try_open)
         except (TimeoutException, StaleElementReferenceException):
-            # Reset popup and retry
             close_calendar(driver)
             time.sleep(0.2)
             open_calendar(driver, timeout=timeout)
@@ -189,10 +174,6 @@ def set_year(driver, year: int, timeout=20):
 
 
 def set_month(driver, month: int, timeout=20):
-    """
-    Uses the month-grid selection (same logic you want),
-    but ensures the month grid is definitely open first.
-    """
     abbr = MONTH_ABBR[month]
     wait = WebDriverWait(driver, timeout)
 
@@ -203,7 +184,6 @@ def set_month(driver, month: int, timeout=20):
             EC.presence_of_element_located((By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {MONTH_VIEW_CSS}"))
         )
 
-        # Case-insensitive match (Jan vs JAN)
         month_btn_xpath = (
             ".//button[.//span[translate(normalize-space(.),"
             "'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
@@ -223,7 +203,6 @@ def click_day(driver, day: int, timeout=20):
     wait = WebDriverWait(driver, timeout)
 
     def _do():
-        # After month click, it should return to day view; wait day grid
         day_view = wait.until(
             EC.presence_of_element_located((By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {DAY_VIEW_CSS}"))
         )
@@ -239,7 +218,6 @@ def click_day(driver, day: int, timeout=20):
         driver.execute_script("arguments[0].click();", btn)
         time.sleep(0.15)
 
-        # Apply
         try:
             driver.switch_to.active_element.send_keys(Keys.ENTER)
         except Exception:
@@ -265,7 +243,6 @@ def wait_date_applied(driver, target_ymd: str, timeout=30):
 def pick_date(driver, date_str: str, timeout=30):
     dt = datetime.strptime(date_str, "%Y-%m-%d")
 
-    # Always reopen calendar fresh each loop
     open_calendar(driver, timeout=timeout)
 
     if get_current_year(driver, timeout=timeout) != dt.year:
@@ -318,25 +295,67 @@ def first_row_key(driver):
 
 
 def go_to_next_page(driver, wait, current_page):
+    """
+    More reliable pagination:
+    - waits a little for q-pagination to render
+    - tries numbered button (2,3,4...)
+    - fallback to chevron_right (next) button
+    """
     target = str(current_page + 1)
 
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+    time.sleep(0.3)
+
+    before = first_row_key(driver)
+
+    # Strategy 1: numbered page button
     buttons = driver.find_elements(
         By.XPATH,
         f"//div[contains(@class,'q-pagination')]//button[normalize-space()='{target}']"
     )
 
-    if not buttons:
-        return False
+    if buttons:
+        driver.execute_script("arguments[0].click();", buttons[0])
+        if before is not None:
+            wait.until(lambda d: first_row_key(d) != before)
+        else:
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+        return True
 
-    before = first_row_key(driver)
-    driver.execute_script("arguments[0].click();", buttons[0])
+    # Strategy 2: next arrow
+    next_btns = driver.find_elements(
+        By.XPATH,
+        "//div[contains(@class,'q-pagination')]//button[.//i[normalize-space()='chevron_right']]"
+    )
 
-    if before is not None:
-        wait.until(lambda d: first_row_key(d) != before)
-    else:
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+    if next_btns:
+        driver.execute_script("arguments[0].click();", next_btns[-1])
 
-    return True
+        if before is not None:
+            wait.until(lambda d: first_row_key(d) != before)
+        else:
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+
+        after = first_row_key(driver)
+        if before is not None and after == before:
+            return False
+        return True
+
+    return False
+
+
+def wait_table_ready(driver, timeout=40):
+    wait = WebDriverWait(driver, timeout)
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr")))
+
+    k1 = first_row_key(driver)
+    for _ in range(25):
+        time.sleep(0.2)
+        k2 = first_row_key(driver)
+        if k2 and k2 == k1:
+            return
+        k1 = k2
 
 
 def daterange_inclusive(start_date: str, end_date: str):
@@ -383,10 +402,20 @@ def main():
         driver.get(URL)
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
 
-        for run_date in daterange_inclusive(start_date, end_date):
+        dates = list(daterange_inclusive(start_date, end_date))
+
+        for idx, run_date in enumerate(dates):
             print(f"\n=== Processing date: {run_date} ===")
 
+            # After first date completes, refresh page before next date
+            if idx > 0:
+                driver.refresh()
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
+                time.sleep(2)
+
+            # Pick date then wait few seconds / until stable
             pick_date(driver, run_date, timeout=30)
+            wait_table_ready(driver, timeout=40)
 
             out_csv = os.path.join(out_dir, f"floorsheet_{run_date}.csv")
 
