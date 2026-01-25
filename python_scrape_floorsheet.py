@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -59,6 +59,24 @@ def wait_qdate(driver, timeout=20):
     )
 
 
+def is_calendar_open(driver):
+    return bool(driver.find_elements(By.CSS_SELECTOR, QDATE_ROOT_CSS))
+
+
+def close_calendar(driver):
+    # Close popup reliably (ESC) if open
+    if is_calendar_open(driver):
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        # Wait it disappears (best-effort)
+        for _ in range(20):
+            if not is_calendar_open(driver):
+                return
+            time.sleep(0.1)
+
+
 def find_date_input(driver):
     inputs = driver.find_elements(By.XPATH, "//input[(@type='text' or not(@type))]")
     for el in inputs:
@@ -74,13 +92,54 @@ def find_date_input(driver):
 
 
 def open_calendar(driver, timeout=20):
+    """
+    Always opens calendar fresh:
+    - if open, close then reopen (avoids stuck state after previous date)
+    """
+    close_calendar(driver)
+
     el = find_date_input(driver)
     if not el:
         raise RuntimeError("Date input not found")
+
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
     driver.execute_script("arguments[0].click();", el)
+
     wait_qdate(driver, timeout)
     time.sleep(0.1)
+
+
+def ensure_month_grid_open(driver, timeout=20):
+    """
+    Robustly open the month grid (JAN-DEC).
+    Retries because Quasar sometimes ignores the first click in headless.
+    """
+    wait = WebDriverWait(driver, timeout)
+
+    def _try_open():
+        # If already open, ok
+        if driver.find_elements(By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {MONTH_VIEW_CSS}"):
+            return True
+
+        # Click month label in navigation
+        mbtn = wait.until(EC.element_to_be_clickable((By.XPATH, NAV_MONTH_BTN_XPATH)))
+        driver.execute_script("arguments[0].click();", mbtn)
+
+        # Wait month grid appears
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {MONTH_VIEW_CSS}")))
+        return True
+
+    # Attempt multiple times; if still fails, reopen calendar and try again
+    for attempt in range(3):
+        try:
+            return retry_on_stale(_try_open)
+        except (TimeoutException, StaleElementReferenceException):
+            # Reset popup and retry
+            close_calendar(driver)
+            time.sleep(0.2)
+            open_calendar(driver, timeout=timeout)
+
+    raise TimeoutException("Month grid (JAN-DEC) did not open after retries.")
 
 
 def get_current_year(driver, timeout=20) -> int:
@@ -131,26 +190,20 @@ def set_year(driver, year: int, timeout=20):
 
 def set_month(driver, month: int, timeout=20):
     """
-    Stale-safe month selection:
-    - never waits inside old root element
-    - finds month grid from driver every time
-    - retries on Quasar re-render
+    Uses the month-grid selection (same logic you want),
+    but ensures the month grid is definitely open first.
     """
     abbr = MONTH_ABBR[month]
     wait = WebDriverWait(driver, timeout)
 
     def _do():
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, QDATE_ROOT_CSS)))
-
-        # Open month grid only if not already open
-        if not driver.find_elements(By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {MONTH_VIEW_CSS}"):
-            mbtn = wait.until(EC.element_to_be_clickable((By.XPATH, NAV_MONTH_BTN_XPATH)))
-            driver.execute_script("arguments[0].click();", mbtn)
+        ensure_month_grid_open(driver, timeout=timeout)
 
         month_view = wait.until(
             EC.presence_of_element_located((By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {MONTH_VIEW_CSS}"))
         )
 
+        # Case-insensitive match (Jan vs JAN)
         month_btn_xpath = (
             ".//button[.//span[translate(normalize-space(.),"
             "'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
@@ -167,12 +220,10 @@ def set_month(driver, month: int, timeout=20):
 
 
 def click_day(driver, day: int, timeout=20):
-    """
-    Stale-safe day selection (same reason as month).
-    """
     wait = WebDriverWait(driver, timeout)
 
     def _do():
+        # After month click, it should return to day view; wait day grid
         day_view = wait.until(
             EC.presence_of_element_located((By.CSS_SELECTOR, f"{QDATE_ROOT_CSS} {DAY_VIEW_CSS}"))
         )
@@ -186,9 +237,9 @@ def click_day(driver, day: int, timeout=20):
             EC.element_to_be_clickable((By.XPATH, day_btn_xpath))
         )
         driver.execute_script("arguments[0].click();", btn)
-        time.sleep(0.1)
+        time.sleep(0.15)
 
-        # Helps some UIs apply the selected date
+        # Apply
         try:
             driver.switch_to.active_element.send_keys(Keys.ENTER)
         except Exception:
@@ -214,6 +265,7 @@ def wait_date_applied(driver, target_ymd: str, timeout=30):
 def pick_date(driver, date_str: str, timeout=30):
     dt = datetime.strptime(date_str, "%Y-%m-%d")
 
+    # Always reopen calendar fresh each loop
     open_calendar(driver, timeout=timeout)
 
     if get_current_year(driver, timeout=timeout) != dt.year:
