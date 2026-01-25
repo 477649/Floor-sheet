@@ -256,7 +256,7 @@ def pick_date(driver, date_str: str, timeout=30):
 
 
 # ----------------------------
-# YOUR EXISTING SCRAPE CODE (UNCHANGED)
+# SCRAPE HELPERS
 # ----------------------------
 def parse_numeric(value):
     if value is None:
@@ -296,58 +296,42 @@ def first_row_key(driver):
 
 def go_to_next_page(driver, wait, current_page):
     """
-    More reliable pagination:
-    - waits a little for q-pagination to render
-    - tries numbered button (2,3,4...)
-    - fallback to chevron_right (next) button
+    If pagination click doesn't change rows (Timeout), we return 'TIMEOUT'
+    so main() can skip this date safely.
     """
     target = str(current_page + 1)
 
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
-    time.sleep(0.3)
-
-    before = first_row_key(driver)
-
-    # Strategy 1: numbered page button
     buttons = driver.find_elements(
         By.XPATH,
         f"//div[contains(@class,'q-pagination')]//button[normalize-space()='{target}']"
     )
 
-    if buttons:
-        driver.execute_script("arguments[0].click();", buttons[0])
+    if not buttons:
+        return False
+
+    before = first_row_key(driver)
+    driver.execute_script("arguments[0].click();", buttons[0])
+
+    try:
         if before is not None:
             wait.until(lambda d: first_row_key(d) != before)
         else:
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
         return True
-
-    # Strategy 2: next arrow
-    next_btns = driver.find_elements(
-        By.XPATH,
-        "//div[contains(@class,'q-pagination')]//button[.//i[normalize-space()='chevron_right']]"
-    )
-
-    if next_btns:
-        driver.execute_script("arguments[0].click();", next_btns[-1])
-
-        if before is not None:
-            wait.until(lambda d: first_row_key(d) != before)
-        else:
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
-
-        after = first_row_key(driver)
-        if before is not None and after == before:
-            return False
-        return True
-
-    return False
+    except TimeoutException:
+        return "TIMEOUT"
 
 
 def wait_table_ready(driver, timeout=40):
     wait = WebDriverWait(driver, timeout)
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr")))
+
+    # Give the body a chance to render (closed days might not have meaningful rows)
+    end = time.time() + 8
+    while time.time() < end:
+        if driver.find_elements(By.CSS_SELECTOR, "table tbody tr"):
+            break
+        time.sleep(0.2)
 
     k1 = first_row_key(driver)
     for _ in range(25):
@@ -407,43 +391,62 @@ def main():
         for idx, run_date in enumerate(dates):
             print(f"\n=== Processing date: {run_date} ===")
 
-            # After first date completes, refresh page before next date
+            # Refresh before next date (as you requested)
             if idx > 0:
                 driver.refresh()
                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table")))
                 time.sleep(2)
 
-            # Pick date then wait few seconds / until stable
             pick_date(driver, run_date, timeout=30)
             wait_table_ready(driver, timeout=40)
+
+            # Quick no-row check (closed/no data)
+            if not driver.find_elements(By.CSS_SELECTOR, "table tbody tr") or not (first_row_key(driver) or "").strip():
+                print(f"NEPSE closed / no data for {run_date}. Skipping.")
+                continue
 
             out_csv = os.path.join(out_dir, f"floorsheet_{run_date}.csv")
 
             all_data = []
             current_page = 1
+            skip_date = False
 
             while True:
                 all_data.extend(scrape_current_page(driver))
                 print(f"Scraped page: {current_page} (date {run_date})")
 
-                if not go_to_next_page(driver, wait, current_page):
+                res = go_to_next_page(driver, wait, current_page)
+
+                if res == "TIMEOUT":
+                    print(f"NEPSE closed / paging not working for {run_date}. Skipping this date.")
+                    all_data = []
+                    skip_date = True
+                    break
+
+                if res is False:
                     break
 
                 current_page += 1
+
+            if skip_date or not all_data:
+                print(f"Skipped saving for {run_date}. Moving to next date.")
+                continue
 
             df = pd.DataFrame(all_data)
             header = ["Transact No.", "Symbol", "Buyer", "Seller", "Quantity", "Rate", "Amount"]
 
             if df.empty:
-                df = pd.DataFrame(columns=header)
+                print(f"Empty table for {run_date}. Skipping save.")
+                continue
 
-            if df.shape[1] == len(header):
-                df.columns = header
-                df["Quantity"] = df["Quantity"].apply(parse_numeric)
-                df["Rate"] = df["Rate"].apply(parse_numeric)
-                df["Amount"] = df["Amount"].apply(parse_numeric)
-            else:
-                raise ValueError(f"Column mismatch on {run_date}. Got {df.shape[1]} columns.")
+            if df.shape[1] != len(header):
+                print(f"Column mismatch for {run_date}. Skipping this date.")
+                continue
+
+            df.columns = header
+            df["Quantity"] = df["Quantity"].apply(parse_numeric)
+            df["Rate"] = df["Rate"].apply(parse_numeric)
+            df["Amount"] = df["Amount"].apply(parse_numeric)
 
             df.to_csv(out_csv, index=False, encoding="utf-8-sig")
             print(f"Saved successfully: {out_csv}")
