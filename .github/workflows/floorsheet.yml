@@ -5,6 +5,9 @@ on:
     - cron: "45 9 * * *"  # 09:45 UTC = 15:30 Nepal time
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
@@ -27,6 +30,7 @@ jobs:
         env:
           START_DATE: "2025-12-01"
           END_DATE: "2025-12-02"
+          PYTHONUNBUFFERED: "1"
         run: |
           python scrape_floorsheet.py
 
